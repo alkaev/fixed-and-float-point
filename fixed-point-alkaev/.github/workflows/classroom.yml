@@ -1,0 +1,304 @@
+name: CI/CD
+
+on:
+  create:
+  repository_dispatch:
+  workflow_dispatch:
+    inputs:
+      toward_zero:
+        description: "Округление к 0"
+        default: true
+        type: boolean
+      toward_nearest_even:
+        description: "Округление к ближайшему чётному"
+        default: false
+        type: boolean
+      toward_pinf:
+        description: "Округление к +inf"
+        default: false
+        type: boolean
+      toward_ninf:
+        description: "Округление к -inf"
+        default: false
+        type: boolean
+  
+env:
+  BUILDLOG: "build.log"
+  OUTLOG: "result.log"
+  
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  buildtest:
+    strategy:
+      max-parallel: 1
+      fail-fast: true
+      matrix:
+        os:  [ubuntu-24.04, windows-latest] 
+    
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 4
+    env:    
+      STUPID_LINUX_LIBM: $(If ('${{ matrix.os }}' -eq 'windows-latest') {''} Else {'-lm'})
+      EXE: __test.exe
+
+    steps:
+      - uses: actions/checkout@v4
+          
+      - name: init
+        id: init
+        run: |
+          echo "# Parameters" >> $env:GITHUB_STEP_SUMMARY  
+          echo " Округление к 0 (0) - toward_zero: $${{ inputs.toward_zero }}" >> $env:GITHUB_STEP_SUMMARY
+          echo " Округление к ближайшему чётному (1) - toward_nearest_even: $${{ inputs.toward_nearest_even }}" >> $env:GITHUB_STEP_SUMMARY
+          echo " Округление к +inf (2) - toward_pinf: $${{ inputs.toward_pinf }}" >> $env:GITHUB_STEP_SUMMARY
+          echo " Округление к -inf (3) - toward_ninf: $${{ inputs.toward_ninf }}" >> $env:GITHUB_STEP_SUMMARY
+            
+        
+      - name: detect_lang
+        id: detect_lang
+        run: | 
+          echo "# Detect language" >> $env:GITHUB_STEP_SUMMARY
+          $ErrorActionPreference = 'SilentlyContinue'
+          $python = Get-ChildItem -Force -File -Name main.py
+          $cpp = Get-ChildItem -Force -File -Name main.cpp
+          $c = Get-ChildItem -Force -File -Name main.c
+
+          [void](mkdir __build)
+
+          "::group::debug info"
+          echo "python=$python $($python.GetType()) $($python.GetType() -eq [String])"
+          echo "cpp=$cpp $($cpp.GetType()) $($cpp.GetType() -eq [String])"
+          echo "c=$c $($c.GetType()) $($c.GetType() -eq [String])"
+          "::endgroup::" 
+
+          if ($python.GetType() -eq [String])
+          {
+              echo "Detect ✅: Python">> $env:GITHUB_STEP_SUMMARY
+              echo "lang=0" >> $env:GITHUB_OUTPUT 
+              exit(0)
+          }
+          if ($cpp.GetType() -eq [String])
+          {
+              $version = $(clang++ --version) -join "`n"
+              echo "Detect ✅: C++">> $env:GITHUB_STEP_SUMMARY
+                echo '```' >> $env:GITHUB_STEP_SUMMARY
+                echo "$($version)">> $env:GITHUB_STEP_SUMMARY
+                echo '```' >> $env:GITHUB_STEP_SUMMARY
+                echo "lang=1" >> $env:GITHUB_OUTPUT      
+              exit(0)
+          }
+          if ($c.GetType() -eq [String])
+          {
+              $version = $(clang --version) -join "`n"
+              echo "Detect ✅: C">> $env:GITHUB_STEP_SUMMARY
+                echo '```' >> $env:GITHUB_STEP_SUMMARY
+                echo "$($version)">> $env:GITHUB_STEP_SUMMARY
+                echo '```' >> $env:GITHUB_STEP_SUMMARY
+                echo "lang=2" >> $env:GITHUB_OUTPUT      
+              exit(0)
+          }
+          echo "Detect failed ❌">> $env:GITHUB_STEP_SUMMARY             
+          exit(1)
+
+      - uses: actions/setup-python@v5
+        if: steps.detect_lang.outputs.lang == 0
+        with:
+          python-version: '3.12'
+          architecture: 'x64'
+          
+      - name: setup-python-info
+        if: steps.detect_lang.outputs.lang == 0
+        run: |
+            $version = $(python --version) -join "`n"
+            echo '```' >> $env:GITHUB_STEP_SUMMARY
+            echo "$($version)">> $env:GITHUB_STEP_SUMMARY
+            echo '```' >> $env:GITHUB_STEP_SUMMARY         
+
+      - name: build
+        id: build
+        if: steps.detect_lang.outputs.lang > 0
+        run: |   
+          #Get-ChildItem Env:* | Select-Object -Property Name,Value | Sort-Object -Property Name
+          $failed = $false
+          try 
+          {
+            $ErrorActionPreference = 'SilentlyContinue'
+                 
+            cd __build 
+            clang --version
+            if (${{ steps.detect_lang.outputs.lang }} -eq 2)  
+            {
+              pwsh -Command { clang -std=c2x -D _CRT_SECURE_NO_WARNINGS -D _USE_MATH_DEFINES -O2 -Wvla -I '../include/' $((Get-ChildItem -Path .. -Include @('*.c') -Recurse -ErrorAction SilentlyContinue -Force).FullName) -o ${{env.EXE}} *>&1 > ${{env.BUILDLOG}} } 
+            }
+            else
+            {
+              pwsh -Command { clang++ -std=c++20 -D _CRT_SECURE_NO_WARNINGS -D _USE_MATH_DEFINES -O2 -I '../include/' $((Get-ChildItem -Path .. -Include @('*.cpp') -Recurse -ErrorAction SilentlyContinue -Force).FullName) -o ${{env.EXE}} *>&1 > ${{env.BUILDLOG}} } 
+            }
+            
+            $build_exit_code = $LastExitCode     
+          } 
+          catch
+          {
+            $build_exit_code = $LastExitCode
+            Write-Output "❌ build failed!"
+            $failed = $true
+          } 
+          finally 
+          {
+            $blog="$(Get-Content ${{env.BUILDLOG}} -Raw)"
+            echo "# Build" >> $env:GITHUB_STEP_SUMMARY
+            echo '```' >> $env:GITHUB_STEP_SUMMARY
+            "$blog" >> $env:GITHUB_STEP_SUMMARY
+            echo '```' >> $env:GITHUB_STEP_SUMMARY
+            
+            Write-Output "::notice Build log (can be empty):"
+            "::group::Build log"
+            echo $blog
+            echo "::endgroup::"  
+            if ($failed) { echo "## Build failed" >> $env:GITHUB_STEP_SUMMARY }
+          }
+          exit($build_exit_code + (-not (Test-Path -Path "./${{env.EXE}}" -PathType Leaf)) )
+                         
+      - name: tests
+        id: tests
+        run: |     
+          echo "# Testing" >> $env:GITHUB_STEP_SUMMARY
+
+          $tests = @()
+
+          $tests += New-Object PSObject -Property @{ name="fixed: вывод с округлением 0"; active=$${{inputs.toward_zero}};         argv="16.12 0 0x17360"; ref="23.210" }  
+          $tests += New-Object PSObject -Property @{ name="fixed: вывод с округлением 1"; active=$${{inputs.toward_nearest_even}}; argv="16.12 1 0x17360"; ref="23.211" }  
+          $tests += New-Object PSObject -Property @{ name="fixed: вывод с округлением 2"; active=$${{inputs.toward_pinf}};         argv="16.12 2 0x17360"; ref="23.211" }  
+          $tests += New-Object PSObject -Property @{ name="fixed: вывод с округлением 3"; active=$${{inputs.toward_ninf}};         argv="16.12 3 0x17360"; ref="23.210" }  
+
+          $tests += New-Object PSObject -Property @{ name="fixed: вывод с округлением 0"; active=$${{inputs.toward_zero}};         argv="8.8 0 0x9c9f"; ref="-99.378" }  
+          $tests += New-Object PSObject -Property @{ name="fixed: вывод с округлением 1"; active=$${{inputs.toward_nearest_even}}; argv="8.8 1 0x9c9F"; ref="-99.379" }  
+          $tests += New-Object PSObject -Property @{ name="fixed: вывод с округлением 2"; active=$${{inputs.toward_pinf}};         argv="8.8 2 0x9C9f"; ref="-99.378" }  
+          $tests += New-Object PSObject -Property @{ name="fixed: вывод с округлением 3"; active=$${{inputs.toward_ninf}};         argv="8.8 3 0x9c9f"; ref="-99.379" }  
+
+          $tests += New-Object PSObject -Property @{ name="fixed: + с округлением 0"; active=$${{inputs.toward_zero}};             argv="8.8 0 0xdc9f + 0xD736"; ref="-76.167" }
+          $tests += New-Object PSObject -Property @{ name="fixed: + с округлением 1"; active=$${{inputs.toward_nearest_even}};     argv="8.8 1 0xDc9f + 0xd736"; ref="-76.168" }
+          $tests += New-Object PSObject -Property @{ name="fixed: + с округлением 2"; active=$${{inputs.toward_pinf}};             argv="8.8 2 0xdC9f + 0xd736"; ref="-76.167" }
+          $tests += New-Object PSObject -Property @{ name="fixed: + с округлением 3"; active=$${{inputs.toward_ninf}};             argv="8.8 3 0xdc9F + 0xd736"; ref="-76.168" }
+
+          $tests += New-Object PSObject -Property @{ name="fixed: div_by_0"; active=$${{inputs.toward_zero}};                      argv="4.4 0 0x12 / 0x100"; ref="div_by_0" } 
+          $tests += New-Object PSObject -Property @{ name="fixed: div_by_0"; active=$${{inputs.toward_nearest_even}};              argv="4.4 1 0x12 / 0x100"; ref="div_by_0" } 
+          $tests += New-Object PSObject -Property @{ name="fixed: div_by_0"; active=$${{inputs.toward_pinf}};                      argv="4.4 2 0x12 / 0x100"; ref="div_by_0" } 
+          $tests += New-Object PSObject -Property @{ name="fixed: div_by_0"; active=$${{inputs.toward_ninf}};                      argv="4.4 3 0x12 / 0x100"; ref="div_by_0" }                     
+                    
+          $test_exit_code = $tests.Count
+          
+          cd __build
+          
+          $testlogs = @()
+
+          foreach ($test in $tests)
+          {
+            if (-not $test.active) 
+            {
+              $test_exit_code -= 1
+              continue
+            }
+
+            "::group::Output log test: $($test.name) [$($test_exit_code)]"
+          
+            $testlog = New-Object PSObject -Property @{ name=$test.name; input=$test.argv.Split(); output=""; ref=$test.ref; exit_code=0; stderr=""; time=0; verdict=""; status="x" }
+
+            $stopwatch = [System.Diagnostics.Stopwatch]::new()
+            $Stopwatch.Start()
+
+            
+            $exec = ""
+            $exec_args = ""
+            if (${{ steps.detect_lang.outputs.lang }} -ne 0)  
+            { 
+              $exec = "./${{env.EXE}}"
+              $exec_args = "$($testlog.input)".Split()
+            }
+            else
+            { 
+              $exec = "python"
+              $exec_args = "../main.py $($testlog.input)".Split()
+            }
+
+            $stopwatch = [System.Diagnostics.Stopwatch]::new()
+            $Stopwatch.Start()
+                        
+            $pr = Start-Process python -PassThru -ArgumentList "../.github/workflows/run_tests.py $($exec) 2 $($exec_args)" -UseNewEnvironment -NoNewWindow
+            $handle = $pr.Handle 
+            $timeouted = (-not $pr.WaitForExit(2000))
+            $testlog.exit_code = $pr.ExitCode
+              
+            $Stopwatch.Stop()
+            $testlog.time = $Stopwatch.Elapsed
+                
+            if ($timeouted -or ($pr.ExitCode -eq 255 -and  $(Get-Content stdout.log) -eq "Timeout expired."))
+            {        
+              $testlog.verdict = "[🕒] Timeout" 
+              $testlog.status = "t"    
+              $testlogs += $testlog  
+              continue
+            }
+            
+            $testlog.exit_code = "0x"+($testlog.exit_code).ToString("X")
+
+            $testlog.stderr = if ((& Test-Path -Path stderr.log -PathType Leaf)) { $(Get-Content stderr.log -Raw) } else { '<empty>' }
+            $testlog.output = if ((& Test-Path -Path stdout.log -PathType Leaf)) { $(Get-Content stdout.log -Raw) } else { '<empty>' }
+            $testlog.input = $test.argv
+                  
+            $verdict = ""                     
+            if ($testlog.exit_code -ne "0x0" -or $pr.ExitCode -ne 0)
+            {               
+              $verdict += "❌ [ERROR] Program completed with code $($pr.ExitCode) (!= 0)"
+              echo $testlog.exit_code
+            }          
+            elseif ($testlog.stderr -ne '<empty>' -and $testlog.stderr.Length -ne 0)
+            {
+              $verdict += "❌ [ERROR] Stderr is not empty"
+              echo $($testlog.stderr)
+            } 
+            elseif ($testlog.output -eq '<empty>' -or $testlog.output -eq "" -or $testlog.output -eq $null)
+            {
+              $verdict += "❌ [ERROR] Stdout is empty"
+              echo $($testlog.output)
+            }
+            else
+            {
+              if ($testlog.ref -ceq $testlog.output.split([System.Environment]::NewLine, [System.StringSplitOptions]::RemoveEmptyEntries)[0]) 
+              { 
+                $verdict += " " # ✅ PASSED
+                $testlog.status = " "
+                $test_exit_code -= 1 
+              }
+              else
+              {
+                $verdict += "❌ FAILED [output != expected]" 
+                echo $verdict 
+              }                 
+            }
+
+            $testlog.verdict = $verdict
+            $testlog.output = if ($testlog.output -eq $null) { "" } else { $testlog.output.Trim().replace('\n', '<br>') }
+            $testlog.stderr = if ($testlog.stderr -eq $null) { "" } else { $testlog.stderr.Trim().replace('\n', '<br>') }
+            
+            $testlogs += $testlog
+            "::endgroup::" 
+          }    
+
+          $prety = $testlogs | Format-Table -AutoSize -Property status, name, input, output, ref, exit_code, time, stderr | Out-String
+          Write-Host $prety
+                      
+          echo "| # | status | name | input | output | ref | exit code | time | error | stderr |" >> $env:GITHUB_STEP_SUMMARY  
+          echo "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |" >> $env:GITHUB_STEP_SUMMARY  
+          $it = 0;
+          foreach ($testlog in $testlogs)
+          {          
+            $log = "| $($it) | $($testlog.status) | $($testlog.name) | $($testlog.input) | $($testlog.output) | $($testlog.ref) | <code>$($testlog.exit_code)</code> | <code>$($testlog.time)</code> | <code>$($testlog.verdict)</code>  | <code>$($testlog.stderr)</code> | "
+            echo $log >> $env:GITHUB_STEP_SUMMARY  
+            $it+=1;
+          }
+        
+          exit($test_exit_code)
